@@ -1,0 +1,82 @@
+name: Build Windows executable
+on:
+  push:
+    paths:
+      - projector_control.py
+      - .github/workflows/build-windows.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller==6.16.0
+      - name: Build standalone GUI executable
+        run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name Projector-Control projector_control.py
+      - name: Verify PE headers and launch GUI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'dist/Projector-Control.exe').Path
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          if ($bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Missing MZ signature' }
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw 'Missing PE signature' }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x8664) { throw 'Not AMD64' }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 24) -ne 0x20b) { throw 'Not PE32+' }
+          if ([BitConverter]::ToUInt16($bytes, $pe + 24 + 68) -ne 2) { throw 'Not Windows GUI subsystem' }
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          $app = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
+          try {
+            $window = $null
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "Application exited early: $($app.ExitCode)" }
+              $window = Get-Process -Name 'Projector-Control' -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowTitle -eq 'Theater Projector Control' } |
+                Select-Object -First 1
+              if ($window) { break }
+            }
+            if (-not $window) { throw 'Expected application window was not created' }
+            if (-not $window.Responding) { throw 'GUI is not responding' }
+            Start-Sleep -Seconds 3
+            $window.Refresh()
+            if ($window.HasExited -or -not $window.Responding) { throw 'GUI stability check failed' }
+            if (-not $window.CloseMainWindow()) { throw 'Could not close GUI normally' }
+            if (-not $app.WaitForExit(15000)) { throw 'Application failed to exit after closing window' }
+            if ($app.ExitCode -ne 0) { throw "Application exit code: $($app.ExitCode)" }
+            "Verified MZ/PE, AMD64, PE32+, GUI subsystem; expected Tk window opened and responded; clean exit; Python absent from PATH." |
+              Set-Content 'dist/verification.txt'
+          } finally {
+            Get-Process -Name 'Projector-Control' -ErrorAction SilentlyContinue | Stop-Process -Force
+          }
+          Get-FileHash $exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  Projector-Control.exe" } |
+            Set-Content 'dist/SHA256SUMS.txt'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Projector-Control-Windows-x64
+          path: dist/*
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'windows-build-${{ github.run_number }}'
+          $notes = @"
+          Autonomous Windows x64 GUI executable, built with PyInstaller --onefile --windowed.
+          Source commit: ${{ github.sha }}. Projector control logic is unchanged.
+          Verified PE32+ AMD64 GUI executable and successful GUI startup and clean exit on Windows Server 2022, with Python removed from PATH.
+          Intended for Windows 10/11 x64. Physical projectors and those OS versions were not tested.
+          "@
+          $notes | Set-Content release-notes.txt
+          gh release create $tag dist/Projector-Control.exe dist/SHA256SUMS.txt dist/verification.txt --target "${{ github.sha }}" --title "Projector-Control Windows x64 (build ${{ github.run_number }})" --notes-file release-notes.txt
